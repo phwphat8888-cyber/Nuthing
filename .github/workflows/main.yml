@@ -1,0 +1,168 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      # ============================================================
+      # 1. TẠO USER: dumb / I_Love_Snail
+      # ============================================================
+      - name: Create RDP User
+        shell: pwsh
+        run: |
+          $userName = "dumb"
+          $password = "I_Love_Snail"
+          $secPass  = ConvertTo-SecureString $password -AsPlainText -Force
+
+          if (Get-LocalUser -Name $userName -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name $userName -ErrorAction SilentlyContinue
+              Start-Sleep 2
+          }
+
+          New-LocalUser -Name $userName -Password $secPass -AccountNeverExpires -PasswordNeverExpires
+          Add-LocalGroupMember -Group "Administrators"       -Member $userName -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $userName -ErrorAction SilentlyContinue
+
+          Add-Content $env:GITHUB_ENV "RDP_USER=$userName"
+          Add-Content $env:GITHUB_ENV "RDP_PASSWORD=$password"
+
+          Write-Host "==> User: $userName | Password: $password"
+
+      # ============================================================
+      # 2. CẤU HÌNH RDP
+      # ============================================================
+      - name: Configure RDP
+        shell: pwsh
+        run: |
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+              fDenyTSConnections 0 -Force
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+              UserAuthentication 0 -Force
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+              SecurityLayer 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+              dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service TermService -Force
+          Write-Host "==> RDP configured."
+
+      # ============================================================
+      # 3. CÀI TAILSCALE + LẤY IP
+      # ============================================================
+      - name: Install and Connect Tailscale
+        shell: pwsh
+        run: |
+          $msi = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile $msi
+          Start-Process msiexec.exe "/i `"$msi`" /quiet /norestart" -Wait
+          Remove-Item $msi -Force
+
+          $hostName = "gh-rdp-$env:GITHUB_RUN_ID"
+
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+              --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+              --hostname=$hostName `
+              --accept-routes=false
+
+          $ip = $null
+          for ($i = 0; $i -lt 20; $i++) {
+              $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+              if ($ip) { break }
+              Start-Sleep 5
+          }
+
+          if (-not $ip) {
+              Write-Error "Không lấy được Tailscale IP"
+              exit 1
+          }
+
+          $r = Test-NetConnection $ip -Port 3389
+          if (-not $r.TcpTestSucceeded) {
+              Write-Error "Port 3389 unreachable"
+              exit 1
+          }
+
+          Add-Content $env:GITHUB_ENV "TAILSCALE_IP=$ip"
+          Write-Host "==> Tailscale IP: $ip | Hostname: $hostName"
+
+      # ============================================================
+      # 4. THÔNG BÁO DISCORD
+      # ============================================================
+      - name: Notify Discord
+        if: always()
+        shell: pwsh
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          $ip   = if ($env:TAILSCALE_IP) { $env:TAILSCALE_IP } else { "N/A" }
+          $user = "dumb"
+          $pass = "I_Love_Snail"
+          $url  = "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          $now  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss UTC")
+
+          Write-Host "===================================================="
+          Write-Host " Address : $ip"
+          Write-Host " User    : $user"
+          Write-Host " Password: $pass"
+          Write-Host "===================================================="
+
+          if (-not $env:DISCORD_WEBHOOK) {
+              Write-Host "==> Không có DISCORD_WEBHOOK, bỏ qua notify."
+              exit 0
+          }
+
+          $payload = @{
+              username = "RDP Bot"
+              content  = "**✅ RDP Online**"
+              embeds   = @(@{
+                  title  = "🖥️ RDP Ready"
+                  color  = 5763719
+                  fields = @(
+                      @{ name = "🌐 Address";  value = "``$ip``";   inline = $true  }
+                      @{ name = "👤 Username"; value = "``$user``"; inline = $true  }
+                      @{ name = "🔑 Password"; value = "``$pass``"; inline = $false }
+                      @{ name = "🕒 Time";     value = $now;         inline = $true  }
+                      @{ name = "🔗 Workflow"; value = "[GitHub]($url)"; inline = $true }
+                  )
+                  timestamp = (Get-Date).ToUniversalTime().ToString("o")
+              })
+          } | ConvertTo-Json -Depth 10 -Compress
+
+          try {
+              Invoke-RestMethod $env:DISCORD_WEBHOOK -Method Post `
+                  -ContentType "application/json" -Body $payload | Out-Null
+              Write-Host "==> Discord OK."
+          } catch {
+              Write-Warning "Discord: $_"
+          }
+
+      # ============================================================
+      # 5. KEEP ALIVE (giữ runner sống đến hết thời gian)
+      # ============================================================
+      - name: Keep Alive
+        shell: pwsh
+        run: |
+          $maxMinutes = 350   # an toàn dưới hard limit 360 phút
+          $endTime = (Get-Date).AddMinutes($maxMinutes)
+
+          Write-Host "==> Keep-alive đến $endTime UTC"
+          Write-Host "==> User: dumb | Pass: I_Love_Snail"
+
+          while ((Get-Date) -lt $endTime) {
+              $remaining = [math]::Round(($endTime - (Get-Date)).TotalMinutes, 1)
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Còn $remaining phút..."
+              Start-Sleep 300
+          }
+
+          Write-Host "==> Hết thời gian. Workflow kết thúc."
+          
