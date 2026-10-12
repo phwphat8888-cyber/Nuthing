@@ -62,34 +62,65 @@ jobs:
       - name: Install and Connect Tailscale
         shell: pwsh
         run: |
-          $msi = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile $msi
-          Start-Process msiexec.exe "/i `"$msi`" /quiet /norestart" -Wait
-          Remove-Item $msi -Force
+          # Auth key gắn trực tiếp theo yêu cầu
+          $authKey = "tskey-auth-kqTCrC56hH11CNTRL-kJwPGx3KXDhtqL99ECTcDhmyG44fDtSBi"
+
+          $msiUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.76.3-amd64.msi"
+          $msi    = "$env:TEMP\tailscale.msi"
+
+          Write-Host "==> Downloading Tailscale..."
+          Invoke-WebRequest $msiUrl -OutFile $msi -UseBasicParsing
+
+          Write-Host "==> Installing Tailscale..."
+          $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait -PassThru
+          if ($p.ExitCode -ne 0) {
+              Write-Warning "msiexec exit code: $($p.ExitCode)"
+          }
+          Remove-Item $msi -Force -ErrorAction SilentlyContinue
+
+          # Đợi service sẵn sàng
+          $tsPath = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $i = 0
+          while (-not (Test-Path $tsPath) -and $i -lt 30) {
+              Start-Sleep 2
+              $i++
+          }
+          if (-not (Test-Path $tsPath)) {
+              Write-Error "Không tìm thấy tailscale.exe sau khi cài"
+              exit 1
+          }
 
           $hostName = "gh-rdp-$env:GITHUB_RUN_ID"
+          Write-Host "==> Connecting Tailscale (hostname: $hostName)..."
 
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
-              --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
-              --hostname=$hostName `
-              --accept-routes=false
+          & $tsPath up --authkey=$authKey --hostname=$hostName --accept-routes=false
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "tailscale up thất bại (exit $LASTEXITCODE). Kiểm tra lại auth key."
+              exit 1
+          }
 
           $ip = $null
-          for ($i = 0; $i -lt 20; $i++) {
-              $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
-              if ($ip) { break }
-              Start-Sleep 5
+          for ($i = 0; $i -lt 30; $i++) {
+              $ip = & $tsPath ip -4 2>$null
+              if ($ip -and $ip -match '^\d+\.\d+\.\d+\.\d+$') { break }
+              Start-Sleep 3
           }
 
           if (-not $ip) {
-              Write-Error "Không lấy được Tailscale IP"
+              Write-Error "Không lấy được Tailscale IP sau 90 giây"
               exit 1
           }
 
-          $r = Test-NetConnection $ip -Port 3389
-          if (-not $r.TcpTestSucceeded) {
-              Write-Error "Port 3389 unreachable"
-              exit 1
+          Write-Host "==> Đợi port 3389 mở..."
+          $ok = $false
+          for ($i = 0; $i -lt 20; $i++) {
+              $r = Test-NetConnection $ip -Port 3389 -WarningAction SilentlyContinue
+              if ($r.TcpTestSucceeded) { $ok = $true; break }
+              Start-Sleep 3
+          }
+
+          if (-not $ok) {
+              Write-Warning "Port 3389 chưa sẵn sàng ngay, nhưng vẫn tiếp tục (có thể cần thêm vài giây)."
           }
 
           Add-Content $env:GITHUB_ENV "TAILSCALE_IP=$ip"
@@ -147,16 +178,16 @@ jobs:
           }
 
       # ============================================================
-      # 5. KEEP ALIVE (giữ runner sống đến hết thời gian)
+      # 5. KEEP ALIVE
       # ============================================================
       - name: Keep Alive
         shell: pwsh
         run: |
-          $maxMinutes = 350   # an toàn dưới hard limit 360 phút
+          $maxMinutes = 350
           $endTime = (Get-Date).AddMinutes($maxMinutes)
 
-          Write-Host "==> Keep-alive đến $endTime UTC"
-          Write-Host "==> User: dumb | Pass: I_Love_Snail"
+          Write-Host "==> Keep-alive đến $endTime"
+          Write-Host "==> User: dumb | Pass: I_Love_Snail | IP: $($env:TAILSCALE_IP)"
 
           while ((Get-Date) -lt $endTime) {
               $remaining = [math]::Round(($endTime - (Get-Date)).TotalMinutes, 1)
